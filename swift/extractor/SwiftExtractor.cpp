@@ -18,9 +18,7 @@
 
 using namespace codeql;
 
-static void extractFile(const SwiftExtractorConfiguration& config,
-                        swift::CompilerInstance& compiler,
-                        swift::SourceFile& file) {
+static void archiveFile(const SwiftExtractorConfiguration& config, swift::SourceFile* file) {
   if (std::error_code ec = llvm::sys::fs::create_directories(config.trapDir)) {
     std::cerr << "Cannot create TRAP directory: " << ec.message() << "\n";
     return;
@@ -31,7 +29,7 @@ static void extractFile(const SwiftExtractorConfiguration& config,
     return;
   }
 
-  llvm::SmallString<PATH_MAX> srcFilePath(file.getFilename());
+  llvm::SmallString<PATH_MAX> srcFilePath(file->getFilename());
   llvm::sys::fs::make_absolute(srcFilePath);
 
   llvm::SmallString<PATH_MAX> dstFilePath(config.sourceArchiveDir);
@@ -49,12 +47,19 @@ static void extractFile(const SwiftExtractorConfiguration& config,
               << dstFilePath.str().str() << "': " << ec.message() << "\n";
     return;
   }
+}
 
+static void extractModule(const SwiftExtractorConfiguration& config,
+                          swift::CompilerInstance& compiler,
+                          SwiftExtractionMode extractionMode,
+                          swift::ModuleDecl* module,
+                          llvm::StringRef fileName,
+                          llvm::ArrayRef<swift::Decl*> topLevelDecls) {
   // The extractor can be called several times from different processes with
   // the same input file(s)
   // We are using PID to avoid concurrent access
   // TODO: find a more robust approach to avoid collisions?
-  std::string tempTrapName = file.getFilename().str() + '.' + std::to_string(getpid()) + ".trap";
+  std::string tempTrapName = fileName.str() + '.' + std::to_string(getpid()) + ".trap";
   llvm::SmallString<PATH_MAX> tempTrapPath(config.trapDir);
   llvm::sys::path::append(tempTrapPath, tempTrapName);
 
@@ -82,19 +87,20 @@ static void extractFile(const SwiftExtractorConfiguration& config,
   TrapOutput trap{trapStream};
   TrapArena arena{};
 
-  // In the case of emtpy files, the dispatcher is not called, but we still want to 'record' the
-  // fact that the file was extracted
-  auto fileLabel = arena.allocateLabel<FileTag>();
-  trap.assignKey(fileLabel, srcFilePath.str().str());
-  trap.emit(FilesTrap{fileLabel, srcFilePath.str().str()});
-
-  SwiftVisitor visitor(compiler.getSourceMgr(), arena, trap);
-  for (swift::Decl* decl : file.getTopLevelDecls()) {
+  SwiftVisitor visitor(compiler.getSourceMgr(), arena, trap, extractionMode, module, fileName);
+  for (auto decl : topLevelDecls) {
     visitor.extract(decl);
+  }
+  if (topLevelDecls.empty()) {
+    // In the case of empty files, the dispatcher is not called, but we still want to 'record' the
+    // fact that the file was extracted
+    auto fileLabel = arena.allocateLabel<FileTag>();
+    trap.assignKey(fileLabel, fileName.str());
+    trap.emit(FilesTrap{fileLabel, fileName.str()});
   }
 
   // TODO: Pick a better name to avoid collisions
-  std::string trapName = file.getFilename().str() + ".trap";
+  std::string trapName = fileName.str() + ".trap";
   llvm::SmallString<PATH_MAX> trapPath(config.trapDir);
   llvm::sys::path::append(trapPath, trapName);
 
@@ -107,19 +113,19 @@ static void extractFile(const SwiftExtractorConfiguration& config,
 
 void codeql::extractSwiftFiles(const SwiftExtractorConfiguration& config,
                                swift::CompilerInstance& compiler) {
-  // Swift frontend can be called in several different modes, we are interested
-  // only in the cases when either a primary or a main source file is present
-  if (compiler.getPrimarySourceFiles().empty()) {
-    swift::ModuleDecl* module = compiler.getMainModule();
-    if (!module->getFiles().empty() &&
-        module->getFiles().front()->getKind() == swift::FileUnitKind::Source) {
-      // We can only call getMainSourceFile if the first file is of a Source kind
-      swift::SourceFile& file = module->getMainSourceFile();
-      extractFile(config, compiler, file);
-    }
-  } else {
-    for (auto s : compiler.getPrimarySourceFiles()) {
-      extractFile(config, compiler, *s);
+  for (auto& pair : compiler.getASTContext().getLoadedModules()) {
+    auto module = pair.second;
+    if (module->isSystemModule() || module->isBuiltinModule()) {
+      llvm::SmallVector<swift::Decl*> decls;
+      module->getTopLevelDecls(decls);
+      extractModule(config, compiler, SwiftExtractionMode::Module, module,
+                    module->getModuleFilename(), decls);
+    } else {
+      for (auto primaryFile : module->getPrimarySourceFiles()) {
+        archiveFile(config, primaryFile);
+        extractModule(config, compiler, SwiftExtractionMode::PrimaryFile, module,
+                      primaryFile->getFilename(), primaryFile->getTopLevelDecls());
+      }
     }
   }
 }
