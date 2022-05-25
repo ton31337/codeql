@@ -1,0 +1,3 @@
+| Sources/cross-references/lib.swift:4:5:4:13 | ConstructorDecl |
+| Sources/cross-references/lib.swift:14:8:14:8 | ConstructorDecl |
+| Sources/cross-references/main.swift:11:8:11:8 | ConstructorDecl |
